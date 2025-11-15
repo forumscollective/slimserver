@@ -60,6 +60,7 @@ sub initPlugin {
 sub startScan {
     my $class = shift;
 
+    warn "DEBUG: startScan() called\n";
     $log->error("=== AlibScanner::startScan() called ===");
 
     my $alibPath = $prefs->get('alibdb');
@@ -93,7 +94,11 @@ sub startScan {
 
     $log->error("Loading alib metadata into cache...");
     _loadAlibCache();
-    $log->error("Loaded " . scalar(keys %$alibCache) . " tracks from alib");
+    warn "DEBUG: After _loadAlibCache(), cache has " . scalar(keys %$alibCache) . " entries\n";
+    # Additional verification: compare raw DB row count to cache key count
+    my ($dbCount) = $alibDbh->selectrow_array("SELECT COUNT(*) FROM alib");
+    $log->error("Loaded " . scalar(keys %$alibCache) . " tracks from alib (DB rows=$dbCount)");
+    $log->error("DEBUG: cacheKeyCount=" . scalar(keys %$alibCache));
 
     # Process all tracks from alib
     $log->error("Processing tracks from alib...");
@@ -113,27 +118,51 @@ sub startScan {
 }
 
 sub _loadAlibCache {
+    $log->error("DEBUG: _loadAlibCache() called");
     my $sth = $alibDbh->prepare("SELECT * FROM alib");
     $sth->execute();
 
     my $dbRows = 0;
     my $cacheEntries = 0;
+    my %seen;
+    my $dupeUrl = 0;
+    my %lcCount;          # track lower-case collisions for reporting
+    my %lcExamples;       # store up to 3 examples per lower-case key
 
     while (my $row = $sth->fetchrow_hashref) {
         $dbRows++;
         my $path = $row->{__path} or next;
 
-        # Normalize the path to match what LMS will use
+        # Produce canonical LMS URL with original case preserved
         my $url = Slim::Utils::Misc::fixPath($path);
-
-        # Store the entire row indexed by normalized URL only
-        $alibCache->{lc($url)} = $row;
+        $dupeUrl++ if $seen{$url}++;
+        $alibCache->{$url} = $row;
         $cacheEntries++;
+
+        # Lower-case duplicate tracking (diagnostic only)
+        my $lc = lc $url;
+        $lcCount{$lc}++;
+        if ($lcCount{$lc} <= 3) { push @{ $lcExamples{$lc} }, $url; }
     }
 
     $sth->finish();
-    
-    $log->error("DEBUG: DB returned $dbRows rows, stored $cacheEntries cache entries");
+
+    my $finalCacheKeys = scalar(keys %$alibCache);
+    $log->error("DEBUG: DB rows=$dbRows, inserted=$cacheEntries, duplicate URL hits=$dupeUrl, final cache keys=$finalCacheKeys");
+
+    # Report lower-case collisions to help user clean filesystem (only if any)
+    my @lcDupes = grep { $lcCount{$_} > 1 } keys %lcCount;
+    if (@lcDupes) {
+        my $reported = 0;
+        $log->error("DEBUG: lower-case duplicate groups=" . scalar(@lcDupes));
+        for my $k (sort { $lcCount{$b} <=> $lcCount{$a} } @lcDupes) {
+            last if $reported >= 10; # cap output
+            my $examples = join(' | ', @{ $lcExamples{$k} });
+            $log->error("DUPLCASE group size=$lcCount{$k} sample=$examples");
+            $reported++;
+        }
+        $log->error("DEBUG: (showing up to 10 groups, max 3 examples each)");
+    }
 }
 
 sub _processAllTracks {
@@ -202,6 +231,12 @@ sub _installHooks {
         my $alibData = _getAlibMetadata($file);
 
         if ($alibData) {
+            # Sanitize tags here so Schema sees validated values (avoid MUSICBRAINZ_* warnings)
+            if (my $tags = $alibData->{tags}) {
+                my $url = Slim::Utils::Misc::fixPath($file);
+                eval { Slim::Formats::sanitizeTagValues($tags, $url); };
+                $log->warn("Error sanitizing tags in scan for $url: $@") if $@;
+            }
             return $alibData;
         }
 
@@ -214,38 +249,20 @@ sub _installHooks {
     my $original_readTags = \&Slim::Formats::readTags;
     *Slim::Formats::readTags = sub {
         my ($class, $file) = @_;
-        
-        # Check if this file is in alib
+
         my $url = ref($file) ? $file->url : $file;
         $url = Slim::Utils::Misc::fixPath($url) if $url;
-        
-        my $normalizedUrl = lc($url || '');
-        if ($alibCache->{$normalizedUrl}) {
-            # File is in alib, get metadata from there
+
+        if ($url && $alibCache->{$url}) {
             my $alibData = _getAlibMetadata($url);
             if ($alibData && $alibData->{tags}) {
-                # CRITICAL: Sanitize tags before returning them
-                # This prevents the MUSICBRAINZ_ARTIST_ID validation warnings
                 my $tags = $alibData->{tags};
-                
-                # Get content type for proper sanitization
-                my $alibRow = $alibCache->{$normalizedUrl};
-                my $ext = lc($alibRow->{__ext} || '');
-                my ($content_type) = _getTypeInfo($ext);
-                
-                # Sanitize the tags using LMS's built-in sanitizer
-                eval {
-                    Slim::Formats->sanitizeTagValues($url, $tags, $content_type);
-                };
-                if ($@) {
-                    $log->warn("Error sanitizing tags for $url: $@");
-                }
-                
+                eval { Slim::Formats::sanitizeTagValues($tags, $url); };
+                $log->warn("Error sanitizing tags for $url: $@") if $@;
                 return $tags;
             }
         }
-        
-        # Not in alib, return empty tags
+
         return {};
     };
 
@@ -267,9 +284,7 @@ sub _getAlibMetadata {
 
     # Try both with and without file:// prefix
     my $url = Slim::Utils::Misc::fixPath($file);
-    my $normalizedUrl = lc($url);
-
-    my $alibRow = $alibCache->{$normalizedUrl};
+    my $alibRow = $alibCache->{$url};
 
     return unless $alibRow;
 
