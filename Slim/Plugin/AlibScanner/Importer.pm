@@ -197,7 +197,7 @@ sub _processAllTracks {
     my @urls = keys %$alibCache;
     my $total = scalar @urls;
 
-    # Preload existing track URLs to avoid per-track SELECTs
+    # Classify URLs into new vs changed for separate progress bars
     my %existing;
     {
         my $dbh = Slim::Schema->dbh;
@@ -211,27 +211,92 @@ sub _processAllTracks {
             $sth->finish;
             $log->info('AlibScanner: preloaded existing track URL hash size=' . scalar(keys %existing));
         }
+
+        # Preload existing composer contributor sets to detect removals or changes not flagged by sqlmodded
+        my $compSTH = $dbh->prepare(q{
+            SELECT t.url, GROUP_CONCAT(c.name, '\x1F') AS composers
+            FROM tracks t
+            JOIN contributor_track ct ON t.id = ct.track AND ct.role = 2
+            JOIN contributors c ON ct.contributor = c.id
+            GROUP BY t.url
+        });
+        eval { $compSTH->execute(); };
+        if ($@) {
+            $log->warn("AlibScanner: failed to preload composer sets: $@");
+        }
+        else {
+            while (my ($curl, $names) = $compSTH->fetchrow_array) {
+                $existing{"_COMPOSERS_$curl"} = $names; # store separately with prefix key
+            }
+            $compSTH->finish;
+        }
     }
 
-    # Use native-style progress naming: <root>|directory_new
+    my (@newUrls, @changedUrls);
+    for my $url (@urls) {
+        my $row = $alibCache->{$url};
+        if (!$existing{$url}) {
+            push @newUrls, $url;
+        }
+        else {
+            my $markedChanged;
+            if ($row && defined $row->{sqlmodded} && $row->{sqlmodded} > 0) {
+                $markedChanged = 1;
+            }
+            # Detect composer set differences even if sqlmodded not flagged
+            my $dbComposerSet = $existing{"_COMPOSERS_$url"};
+            my $alibComposerRaw = $row->{composer};
+            my @alibComposers;
+            if (defined $alibComposerRaw && length $alibComposerRaw) {
+                @alibComposers = grep { length $_ } map { my $v = $_; $v =~ s/^\s+|\s+$//g; $v } split /\\\\/, $alibComposerRaw;
+            }
+            my @dbComposers = defined $dbComposerSet ? split(/\x1F/, $dbComposerSet) : (); # stored separator
+            # Normalize case and sort for comparison
+            my $normAlib = join('\x1E', sort map { lc $_ } @alibComposers);
+            my $normDb   = join('\x1E', sort map { lc $_ } @dbComposers);
+            if (!$markedChanged) {
+                if ($normAlib ne $normDb) {
+                    $markedChanged = 1;
+                    $log->info("AlibScanner: composer delta detected url=$url db=['$normDb'] alib=['$normAlib'] marking changed");
+                }
+            }
+            push @changedUrls, $url if $markedChanged;
+        }
+    }
+    my $newTotal = scalar @newUrls;
+    my $changedTotal = scalar @changedUrls;
+
+    # Use native-style progress naming: separate new vs changed vs deleted
     my $alibPath = $prefs->get('alibdb') || 'alib';
-    my $progressName = $alibPath . '|directory_new';
-    my $progress = Slim::Utils::Progress->new({
+    my $progressNew = Slim::Utils::Progress->new({
         type  => 'importer',
-        name  => $progressName,
-        total => $total,
+        name  => $alibPath . '|directory_new',
+        total => $newTotal,
         bar   => 1,
     });
+    my $progressChanged;
+    if ($changedTotal) {
+        $progressChanged = Slim::Utils::Progress->new({
+            type  => 'importer',
+            name  => $alibPath . '|directory_changed',
+            total => $changedTotal,
+            bar   => 1,
+        });
+    }
     
-    $log->error("Found " . scalar(@urls) . " tracks in alib to process");
+    $log->error("Found $total tracks in alib (new=$newTotal changed=$changedTotal) to process");
     
     # Process each track
-    my $count = 0;
+    my $count = 0;          # number of new tracks added
+    my $updated = 0;        # number of existing tracks whose metadata was updated (sqlmodded)
+    my $processedNew = 0;   # progress counter for new tracks
+    my $processedChanged = 0; # progress counter for changed tracks
     my %albumSeen;       # distinct album ids
     my $albumSamplesLogged = 0;
-    for my $url (@urls) {
-        # Check if track already exists in database
-        if (!$existing{$url}) {
+    # Process new tracks first
+    for my $url (@newUrls) {
+        my $row = $alibCache->{$url};
+        if (!$existing{$url}) { # always true here, defensive
             # Create new track using our hook for metadata (no filesystem access)
             eval {
                 my $trackId = Slim::Schema->updateOrCreateBase({
@@ -245,6 +310,7 @@ sub _processAllTracks {
                 if ($trackId) {
                     $changes++;
                     $count++;
+                    $processedNew++;
                     # Fetch album id for diagnosis
                     my $dbh2 = Slim::Schema->dbh;
                     my ($albumId) = $dbh2->selectrow_array("SELECT album FROM tracks WHERE id=?", undef, $trackId);
@@ -256,6 +322,26 @@ sub _processAllTracks {
                             $albumSamplesLogged++;
                         }
                     }
+
+                    # Instrumentation: detect placeholder contributor names appearing under wrong roles
+                    if ($trackId && $prefs->get('debugPlaceholders')) {
+                        my $sthP = $dbh2->prepare(q{
+                            SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?
+                        });
+                        eval { $sthP->execute($trackId); };
+                        if (!$@) {
+                            while (my ($r,$n) = $sthP->fetchrow_array) {
+                                if ($n =~ /^(ARTIST|ALBUMARTIST|TRACKARTIST|COMPOSER|CONDUCTOR|BAND|PERFORMER|LYRICIST|ARRANGER|ENGINEER|PRODUCER|MIXER|REMIXER)$/i && $r !~ /^[1-6]$/) {
+                                    $log->error("PLACEHOLDERTRACE unexpected roleMap track=$trackId url=$url role=$r name=$n");
+                                }
+                                # Detect cross-role: name equals different role label than numeric role mapping
+                                if ($n =~ /^(COMPOSER|CONDUCTOR|LYRICIST|PERFORMER)$/i) {
+                                    $log->error("PLACEHOLDERTRACE contributor track=$trackId role=$r name=$n") if $n =~ /^CONDUCTOR$/i && $r != 3;
+                                }
+                            }
+                            $sthP->finish;
+                        }
+                    }
                 }
             };
             
@@ -264,24 +350,118 @@ sub _processAllTracks {
             }
             
             # Commit every 500 tracks to avoid corruption
-            if ($count % 500 == 0) {
+            if ($processedNew % 500 == 0) {
                 Slim::Schema->forceCommit;
                 my $distinctAlbums = scalar keys %albumSeen;
-                $log->error("Processed $count tracks so far... distinctAlbums=$distinctAlbums");
+                $log->error("Processed new $processedNew / $newTotal (added=$count) changed=$updated distinctAlbums=$distinctAlbums");
             }
         }
+        # Progress update every 500 new tracks
+        if ($processedNew % 500 == 0) {
+            eval { $progressNew->update($processedNew) };
+        }
+    }
 
-        # Progress update every 200 tracks (avoid excessive DB writes)
-        if ($count % 500 == 0) {
-            eval { $progress->update($count) };
+    # Process changed tracks
+    for my $url (@changedUrls) {
+        eval {
+            my $trackObjOrId = Slim::Schema->updateOrCreateBase({
+                url        => $url,
+                readTags   => 1,
+                checkMTime => 0,
+                commit     => 0,
+            });
+            if ($trackObjOrId) {
+                $updated++;
+                $processedChanged++;
+                if ($prefs->get('debugPlaceholders')) {
+                    my $dbh2 = Slim::Schema->dbh;
+                    my $idLookup = $dbh2->prepare('SELECT id FROM tracks WHERE url=?');
+                    eval { $idLookup->execute($url); };
+                    if (!$@) {
+                        my ($tid) = $idLookup->fetchrow_array;
+                        $idLookup->finish;
+                        if ($tid) {
+                            my $sthP = $dbh2->prepare(q{
+                                SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?
+                            });
+                            eval { $sthP->execute($tid); };
+                            if (!$@) {
+                                while (my ($r,$n) = $sthP->fetchrow_array) {
+                                    if ($n =~ /^(CONDUCTOR|LYRICIST|PERFORMER)$/i && $r == 2) { # composer role misuse
+                                        $log->error("PLACEHOLDERTRACE updated track id=$tid url=$url composerName=$n role=$r suspect");
+                                    }
+                                }
+                                $sthP->finish;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if ($@) {
+            $log->error("Error updating changed track $url: $@");
+        }
+
+        if ($processedChanged % 500 == 0) {
+            Slim::Schema->forceCommit;
+            my $distinctAlbums = scalar keys %albumSeen;
+            $log->error("Processed changed $processedChanged / $changedTotal (added=$count updated=$updated) distinctAlbums=$distinctAlbums");
+            eval { $progressChanged && $progressChanged->update($processedChanged) };
         }
     }
     
     # Final commit
     Slim::Schema->forceCommit;
-    eval { $progress->update($count); $progress->final; };
+    eval { $progressNew->update($processedNew); $progressNew->final; };
+    eval { $progressChanged && $progressChanged->update($processedChanged); $progressChanged && $progressChanged->final; };
     my $finalDistinctAlbums = scalar keys %albumSeen;
-    $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged)");
+    my $processedTotal = $processedNew + $processedChanged;
+    $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged) added=$count updated=$updated totalProcessed=$processedTotal newProcessed=$processedNew changedProcessed=$processedChanged");
+
+    # Deletion pass: remove tracks no longer present in alib
+    my @deleted;
+    for my $eurl (keys %existing) {
+        next if exists $alibCache->{$eurl};
+        # only handle local file URLs
+        next unless Slim::Music::Info::isFileURL($eurl);
+        push @deleted, $eurl;
+    }
+
+    my $deletedCount = scalar @deleted;
+    if ($deletedCount) {
+        $log->error("AlibScanner: found $deletedCount deleted tracks (present in LMS, missing from alib) - removing");
+        eval { require Slim::Utils::Scanner::Local; };
+        if ($@) {
+            $log->error("AlibScanner: failed to load deletion helper Slim::Utils::Scanner::Local: $@");
+        }
+        else {
+            my $delProgressName = ($prefs->get('alibdb') || 'alib') . '|directory_deleted';
+            my $delProgress = Slim::Utils::Progress->new({
+                type  => 'importer',
+                name  => $delProgressName,
+                total => $deletedCount,
+                bar   => 1,
+            });
+            my $d = 0;
+            for my $url (@deleted) {
+                eval { Slim::Utils::Scanner::Local::deleted($url); };
+                if ($@) {
+                    $log->error("AlibScanner: error deleting $url: $@");
+                }
+                $d++;
+                # update progress every 250 deletions to reduce DB churn
+                if ($d % 250 == 0) {
+                    eval { $delProgress->update($d); };
+                }
+            }
+            # finalize deletion progress
+            eval { $delProgress->update($d); $delProgress->final; };
+            Slim::Schema->forceCommit;
+            $log->error("AlibScanner: deletion pass complete removed=$d");
+            $changes += $deletedCount; # count deletions as changes
+        }
+    }
     
     return $changes;
 }
@@ -473,8 +653,46 @@ sub _getAlibMetadata {
     $tags->{FILESIZE}     = $alibRow->{__file_size_bytes};
     $tags->{TIMESTAMP}    = $alibRow->{__file_mtime} || time();
     $tags->{SECS}         = $alibRow->{__length_seconds} || 0;
-    $tags->{BITRATE}      = $alibRow->{__bitrate_num};
-    $tags->{SAMPLERATE}   = $alibRow->{__frequency_num};
+    # Precise unit parsing for bitrate & samplerate:
+    # Prefer textual columns (__bitrate like '2486.642 kb/s', __frequency like '192.0 kHz').
+    # Fall back to numeric helper columns (__bitrate_num, __frequency_num).
+    # LMS expects BITRATE in bits per second (integer), SAMPLERATE in Hz (integer).
+    my ($scaledBitrate, $scaledRate);
+
+    if (my $bitrateText = $alibRow->{__bitrate}) {
+        if ($bitrateText =~ /([0-9]+(?:\.[0-9]+)?)\s*kb\/?s/i) {
+            my $kbps = $1; $scaledBitrate = int($kbps * 1000 + 0.5);
+        }
+        elsif ($bitrateText =~ /([0-9]+)\s*$/) { # bare number, assume already bps if large
+            my $val = $1; $scaledBitrate = ($val < 10000) ? int($val * 1000) : $val;
+        }
+    }
+    if (!defined $scaledBitrate) {
+        my $rawBitrate = $alibRow->{__bitrate_num};
+        if (defined $rawBitrate) {
+            # If raw < 10000 assume kbps; keep precision lost in _num (integer) vs text.
+            $scaledBitrate = $rawBitrate < 10000 ? int($rawBitrate * 1000) : $rawBitrate;
+        }
+    }
+
+    if (my $freqText = $alibRow->{__frequency}) {
+        if ($freqText =~ /([0-9]+(?:\.[0-9]+)?)\s*kHz/i) {
+            my $khz = $1; $scaledRate = int($khz * 1000 + 0.5);
+        }
+        elsif ($freqText =~ /([0-9]+)\s*Hz/i) {
+            $scaledRate = $1; # already Hz
+        }
+    }
+    if (!defined $scaledRate) {
+        my $rawSamplerate = $alibRow->{__frequency_num};
+        if (defined $rawSamplerate) {
+            # If raw < 3000 assume kHz (covers 44.1, 48, 96, 192 etc); else treat as Hz.
+            $scaledRate = $rawSamplerate < 3000 ? int($rawSamplerate * 1000 + 0.5) : $rawSamplerate;
+        }
+    }
+
+    $tags->{BITRATE}    = $scaledBitrate if defined $scaledBitrate;
+    $tags->{SAMPLERATE} = $scaledRate    if defined $scaledRate;
     $tags->{CHANNELS}     = $alibRow->{__channels} if defined $alibRow->{__channels};
     $tags->{LOSSLESS}     = $lossless;
 
@@ -486,8 +704,8 @@ sub _getAlibMetadata {
         audio_offset => 0,
 
         # Audio properties
-        bitrate     => $alibRow->{__bitrate_num},
-        samplerate  => $alibRow->{__frequency_num},
+        bitrate     => $scaledBitrate,
+        samplerate  => $scaledRate,
         song_length_ms => ($alibRow->{__length_seconds} || 0) * 1000,
 
         # Format
@@ -502,6 +720,9 @@ sub _getAlibMetadata {
     if (my $bps = $alibRow->{__bitspersample}) {
         $info->{bits_per_sample} = $bps;
     }
+
+    # NOTE: Removed previous heuristic placeholder filtering to allow raw alib contributor values
+    # to pass through unchanged for deeper ingestion diagnostics.
 
     return {
         info => $info,
