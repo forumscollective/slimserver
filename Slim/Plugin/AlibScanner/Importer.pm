@@ -116,7 +116,11 @@ sub _loadAlibCache {
     my $sth = $alibDbh->prepare("SELECT * FROM alib");
     $sth->execute();
 
+    my $dbRows = 0;
+    my $cacheEntries = 0;
+
     while (my $row = $sth->fetchrow_hashref) {
+        $dbRows++;
         my $path = $row->{__path} or next;
 
         # Normalize the path to match what LMS will use
@@ -124,9 +128,12 @@ sub _loadAlibCache {
 
         # Store the entire row indexed by normalized URL only
         $alibCache->{lc($url)} = $row;
+        $cacheEntries++;
     }
 
     $sth->finish();
+    
+    $log->error("DEBUG: DB returned $dbRows rows, stored $cacheEntries cache entries");
 }
 
 sub _processAllTracks {
