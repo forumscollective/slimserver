@@ -9,6 +9,7 @@ if ( main::WEBUI ) {
 
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
+use Slim::Music::Import;
 
 my $log = logger('plugin.alibscanner');
 my $prefs = preferences('plugin.alibscanner');
@@ -67,7 +68,24 @@ sub init {
     }
     else {
         warn "AlibScanner: NOT registering importer (enabled=$enabled, alibdb=$alibdb)\n";
+        # Ensure native scanner is active when plugin disabled at startup
+        _restoreNativeScanner();
     }
+
+    # Watch preference changes for dynamic enable/disable
+    $prefs->setChange( sub {
+        my ($pref, $newVal) = @_;
+        return unless $pref eq 'enabled';
+        my $context = main::SCANNER ? 'SCANNER' : 'SERVER';
+        $log->info("AlibScanner pref flip: enabled => $newVal ($context)");
+        if ($newVal) {
+            $log->info('AlibScanner enabling: registering importer and disabling MediaFolderScan');
+            $class->init();
+        } else {
+            $log->info('AlibScanner disabling: restoring native scanner & removing hooks');
+            _disableAlibScanner();
+        }
+    }, 'enabled');
 }
 
 sub getDisplayName {
@@ -76,6 +94,36 @@ sub getDisplayName {
 
 sub enabled {
     return $prefs->get('enabled');
+}
+
+sub _disableAlibScanner {
+    # Mark our importer unused
+    if (Slim::Music::Import->importers->{'Slim::Plugin::AlibScanner::Importer'}) {
+        Slim::Music::Import->useImporter('Slim::Plugin::AlibScanner::Importer', 0);
+    }
+    # Attempt to remove hooks if still present (safe to call even if not installed)
+    eval {
+        require Slim::Plugin::AlibScanner::Importer;
+        Slim::Plugin::AlibScanner::Importer::_removeHooks();
+    };
+    if ($@) {
+        $log->warn("AlibScanner: failed to remove hooks on disable: $@");
+    }
+    _restoreNativeScanner();
+    $log->info('AlibScanner disabled: native scanning restored');
+}
+
+sub _restoreNativeScanner {
+    # Re-add MediaFolderScan if it was deleted entirely
+    require Slim::Media::MediaFolderScan;
+    my $importers = Slim::Music::Import->importers;
+    if (!exists $importers->{'Slim::Media::MediaFolderScan'}) {
+        Slim::Media::MediaFolderScan::init();
+        $log->info('AlibScanner: MediaFolderScan re-added');
+    } else {
+        # Ensure it's enabled
+        Slim::Music::Import->useImporter('Slim::Media::MediaFolderScan', 1);
+    }
 }
 
 1;

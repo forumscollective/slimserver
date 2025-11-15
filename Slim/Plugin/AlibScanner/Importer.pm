@@ -18,6 +18,7 @@ use Slim::Utils::Prefs;
 use Slim::Utils::Scanner;
 use Slim::Schema;
 use Slim::Formats;
+use Slim::Utils::Progress;
 
 my $log = logger('plugin.alibscanner');
 my $prefs = preferences('plugin.alibscanner');
@@ -28,6 +29,7 @@ my $alibCache = {};
 
 # Track whether hooks are installed
 my $hooksInstalled = 0;
+my ($orig_AudioScan_scan, $orig_readTags, $orig_pathFromFileURL);
 
 # This is called by the scanner process when it loads import modules
 sub initPlugin {
@@ -105,11 +107,15 @@ sub startScan {
     my $changes = _processAllTracks();
     $log->error("AlibScanner processed $changes tracks");
 
+    # Restore default scanner behaviour before other importers (artwork, artist images) run
+    _removeHooks();
+
     # Cleanup
     if ($alibDbh) {
         $alibDbh->disconnect();
         $alibDbh = undef;
     }
+    # Keep cache until hooks removed; now safe to free
     $alibCache = {};
 
     Slim::Music::Import->endImporter($class);
@@ -170,11 +176,19 @@ sub _processAllTracks {
     
     # Get all URLs from the cache we already loaded
     my @urls = keys %$alibCache;
+    my $total = scalar @urls;
+    my $progress = Slim::Utils::Progress->new({
+        type  => 'importer',
+        name  => 'AlibScanner',
+        total => $total,
+    });
     
     $log->error("Found " . scalar(@urls) . " tracks in alib to process");
     
     # Process each track
     my $count = 0;
+    my %albumSeen;       # distinct album ids
+    my $albumSamplesLogged = 0;
     for my $url (@urls) {
         # Check if track already exists in database
         my $dbh = Slim::Schema->dbh;
@@ -194,6 +208,17 @@ sub _processAllTracks {
                 if ($trackId) {
                     $changes++;
                     $count++;
+                    # Fetch album id for diagnosis
+                    my $dbh2 = Slim::Schema->dbh;
+                    my ($albumId) = $dbh2->selectrow_array("SELECT album FROM tracks WHERE id=?", undef, $trackId);
+                    if (defined $albumId && $albumId) {
+                        $albumSeen{$albumId}++;
+                        # Log first few samples
+                        if ($albumSamplesLogged < 5) {
+                            $log->error("ALBUMTRACE track=$trackId album=$albumId url=$url");
+                            $albumSamplesLogged++;
+                        }
+                    }
                 }
             };
             
@@ -204,13 +229,22 @@ sub _processAllTracks {
             # Commit every 500 tracks to avoid corruption
             if ($count % 500 == 0) {
                 Slim::Schema->forceCommit;
-                $log->error("Processed $count tracks so far...");
+                my $distinctAlbums = scalar keys %albumSeen;
+                $log->error("Processed $count tracks so far... distinctAlbums=$distinctAlbums");
             }
+        }
+
+        # Progress update every 200 tracks (avoid excessive DB writes)
+        if ($count % 200 == 0) {
+            eval { $progress->update($count) };
         }
     }
     
     # Final commit
     Slim::Schema->forceCommit;
+    eval { $progress->update($count); $progress->finalize; };
+    my $finalDistinctAlbums = scalar keys %albumSeen;
+    $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged)");
     
     return $changes;
 }
@@ -224,6 +258,7 @@ sub _installHooks {
     $log->error("=== AlibScanner: Installing hooks to disable filesystem access ===");
 
     # Hook 1: Replace Audio::Scan::scan to return alib metadata
+    $orig_AudioScan_scan ||= *Audio::Scan::scan{CODE};
     *Audio::Scan::scan = sub {
         my ($class, $file, $opts) = @_;
 
@@ -231,11 +266,16 @@ sub _installHooks {
         my $alibData = _getAlibMetadata($file);
 
         if ($alibData) {
-            # Sanitize tags here so Schema sees validated values (avoid MUSICBRAINZ_* warnings)
             if (my $tags = $alibData->{tags}) {
                 my $url = Slim::Utils::Misc::fixPath($file);
                 eval { Slim::Formats::sanitizeTagValues($tags, $url); };
                 $log->warn("Error sanitizing tags in scan for $url: $@") if $@;
+                for my $mb (grep { /^MUSICBRAINZ.*ID$/ } keys %$tags) {
+                    my $val = $tags->{$mb};
+                    my $ref = ref $val;
+                    my $out = $ref eq 'ARRAY' ? join(',', @$val) : $val;
+                    $log->error("MBIDTRACE scan $mb ref=$ref url=$url val=$out") if defined $out;
+                }
             }
             return $alibData;
         }
@@ -246,7 +286,7 @@ sub _installHooks {
     };
 
     # Hook 2: Override Slim::Formats::readTags to use alib
-    my $original_readTags = \&Slim::Formats::readTags;
+    $orig_readTags ||= *Slim::Formats::readTags{CODE};
     *Slim::Formats::readTags = sub {
         my ($class, $file) = @_;
 
@@ -259,6 +299,12 @@ sub _installHooks {
                 my $tags = $alibData->{tags};
                 eval { Slim::Formats::sanitizeTagValues($tags, $url); };
                 $log->warn("Error sanitizing tags for $url: $@") if $@;
+                for my $mb (grep { /^MUSICBRAINZ.*ID$/ } keys %$tags) {
+                    my $val = $tags->{$mb};
+                    my $ref = ref $val;
+                    my $out = $ref eq 'ARRAY' ? join(',', @$val) : $val;
+                    $log->error("MBIDTRACE readTags $mb ref=$ref url=$url val=$out") if defined $out;
+                }
                 return $tags;
             }
         }
@@ -267,6 +313,7 @@ sub _installHooks {
     };
 
     # Hook 3: Make sure pathFromFileURL returns valid paths
+    $orig_pathFromFileURL ||= *Slim::Utils::Misc::pathFromFileURL{CODE};
     *Slim::Utils::Misc::pathFromFileURL = sub {
         my $url = shift;
         # Strip file:// prefix and return the path
@@ -277,6 +324,22 @@ sub _installHooks {
 
     $log->error("All hooks installed - filesystem access disabled");
     $hooksInstalled = 1;
+}
+
+sub _removeHooks {
+    return unless $hooksInstalled;
+    no warnings 'redefine';
+    if ($orig_AudioScan_scan) {
+        *Audio::Scan::scan = $orig_AudioScan_scan;
+    }
+    if ($orig_readTags) {
+        *Slim::Formats::readTags = $orig_readTags;
+    }
+    if ($orig_pathFromFileURL) {
+        *Slim::Utils::Misc::pathFromFileURL = $orig_pathFromFileURL;
+    }
+    $hooksInstalled = 0;
+    $log->error('AlibScanner: hooks removed, default scanner restored');
 }
 
 sub _getAlibMetadata {
@@ -323,8 +386,9 @@ sub _getAlibMetadata {
         # MusicBrainz IDs - these will be sanitized by LMS
         MUSICBRAINZ_TRACK_ID        => $alibRow->{musicbrainz_trackid},
         MUSICBRAINZ_ALBUM_ID        => $alibRow->{musicbrainz_albumid},
-        MUSICBRAINZ_ARTIST_ID       => _splitMultiValue($alibRow->{musicbrainz_artistid}),
-        MUSICBRAINZ_ALBUM_ARTIST_ID => _splitMultiValue($alibRow->{musicbrainz_albumartistid}),
+        # Pass raw multi-value MusicBrainz fields (sanitizer will split & validate)
+        MUSICBRAINZ_ARTIST_ID       => $alibRow->{musicbrainz_artistid},
+        MUSICBRAINZ_ALBUM_ARTIST_ID => $alibRow->{musicbrainz_albumartistid},
         MUSICBRAINZ_RELEASE_GROUP_ID => $alibRow->{musicbrainz_releasegroupid},
         MUSICBRAINZ_WORK_ID         => $alibRow->{musicbrainz_workid},
 
@@ -365,6 +429,17 @@ sub _getAlibMetadata {
     # Determine content type and lossless from extension
     my $ext = lc($alibRow->{__ext} || '');
     my ($content_type, $lossless) = _getTypeInfo($ext);
+
+    # Provide essential tags normally generated by native scanners so Schema can build albums etc.
+    $tags->{CONTENT_TYPE} = $content_type;
+    $tags->{AUDIO}        = 1;                  # treat all alib entries as audio tracks
+    $tags->{FILESIZE}     = $alibRow->{__file_size_bytes};
+    $tags->{TIMESTAMP}    = $alibRow->{__file_mtime} || time();
+    $tags->{SECS}         = $alibRow->{__length_seconds} || 0;
+    $tags->{BITRATE}      = $alibRow->{__bitrate_num};
+    $tags->{SAMPLERATE}   = $alibRow->{__frequency_num};
+    $tags->{CHANNELS}     = $alibRow->{__channels} if defined $alibRow->{__channels};
+    $tags->{LOSSLESS}     = $lossless;
 
     # Build info hash (matches Audio::Scan structure)
     my $info = {
