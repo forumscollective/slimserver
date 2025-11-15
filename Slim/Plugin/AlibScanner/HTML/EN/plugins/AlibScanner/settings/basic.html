@@ -1,0 +1,50 @@
+[% PROCESS settings/header.html %]
+
+<form method="post">
+    <input type="hidden" name="saveSettings" value="1" />
+    <input name="pref_csrfToken" type="hidden" value="[% csrfToken %]" />
+
+    <div class="settingSection">
+        <div class="settingGroup">
+            <div class="prefHead">[% "PLUGIN_ALIBSCANNER" | string %]</div>
+            <div class="prefDesc">[% "PLUGIN_ALIBSCANNER_DESC" | string %]</div>
+        </div>
+    </div>
+
+    <div class="settingSection">
+        <div class="settingGroup">
+            <div class="setting">
+                <input type="checkbox" name="pref_enabled" id="pref_enabled" value="1"
+                       [% IF prefs.pref_enabled %]checked[% END %] class="stdedit" />
+                <label for="pref_enabled">[% "PLUGIN_ALIBSCANNER_ENABLED" | string %]</label>
+            </div>
+            <div class="prefDesc">[% "PLUGIN_ALIBSCANNER_ENABLED_DESC" | string %]</div>
+        </div>
+    </div>
+
+    <div class="settingSection">
+        <div class="settingGroup">
+            <div class="setting">
+                <div class="label">
+                    <label for="alibdb">[% "PLUGIN_ALIBSCANNER_ALIBDB" | string %]:</label>
+                </div>
+                <div class="control">
+                    <input type="text" name="pref_alibdb" id="alibdb"
+                           value="[% prefs.pref_alibdb | html %]"
+                           class="stdedit" size="60" />
+                </div>
+            </div>
+            <div class="prefDesc">[% "PLUGIN_ALIBSCANNER_ALIBDB_DESC" | string %]</div>
+        </div>
+    </div>
+
+    <div class="settingSection">
+        <div class="settingGroup">
+            <div class="setting">
+                <input type="submit" name="save" value="[% "SAVE" | string %]" class="btn" />
+            </div>
+        </div>
+    </div>
+</form>
+
+[% PROCESS settings/footer.html %]

@@ -1,0 +1,18 @@
+PLUGIN_ALIBSCANNER
+	EN	Alib Scanner
+
+PLUGIN_ALIBSCANNER_DESC
+	EN	Scan music library using metadata from alib database instead of reading files
+
+PLUGIN_ALIBSCANNER_ALIBDB
+	EN	Alib Database Path
+
+PLUGIN_ALIBSCANNER_ALIBDB_DESC
+	EN	Full path to your alib.db file (e.g., /path/to/alib.db)
+
+PLUGIN_ALIBSCANNER_ENABLED
+	EN	Enable Alib Scanning
+
+PLUGIN_ALIBSCANNER_ENABLED_DESC
+	EN	When enabled, metadata will be read from alib database instead of scanning files
+

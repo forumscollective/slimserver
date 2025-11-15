@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<extension>
+  <name>PLUGIN_ALIBSCANNER</name>
+  <creator>audiomuze</creator>
+  <defaultState>enabled</defaultState>
+  <description>Causes Lyrion to build library.db from TagMinder's SQLite tags database rather than reading files from the filesystem</description>
+  <email>audiomuze@gmail.com</email>
+  <id>AF52EF8A-4C76-11E5-885D-FEFF819CDC9F</id>
+  <module>Slim::Plugin::AlibScanner::Plugin</module>
+  <importmodule>Slim::Plugin::AlibScanner::Importer</importmodule>
+  <optionsURL>plugins/AlibScanner/settings/basic.html</optionsURL>
+  <type>2</type>
+  <targetApplication>
+    <id>Lyrion Music Server</id>
+    <maxVersion>*</maxVersion>
+    <minVersion>9.0.0</minVersion>
+  </targetApplication>
+  <version>1.0.0</version>
+</extension>
