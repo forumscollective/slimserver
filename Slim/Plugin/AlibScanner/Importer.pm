@@ -49,15 +49,15 @@ sub initPlugin {
         # CRITICAL: Remove MediaFolderScan completely so no filesystem scanning occurs
         Slim::Music::Import->deleteImporter('Slim::Media::MediaFolderScan');
         
-        # Register ourselves as a 'post' type importer
-        # This runs after file scanning would have happened (but we've disabled it)
+        # Ensure scanner process registers us as a file-phase importer (weight 0) too.
+        # This overrides any prior server-side registration, guaranteeing presence early.
         Slim::Music::Import->addImporter($class, {
-            type   => 'post',
-            weight => 1,
+            type   => 'file',
+            weight => 0,
             use    => 1,
         });
-        
-        warn "AlibScanner::Importer registered and MediaFolderScan deleted\n";
+
+        warn "AlibScanner::Importer registered (file-phase) and MediaFolderScan deleted\n";
     }
 }
 
