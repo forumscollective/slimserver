@@ -323,112 +323,99 @@ sub _processAllTracks {
     my $updated = 0;        # number of existing tracks whose metadata was updated (sqlmodded)
     my $processedNew = 0;   # progress counter for new tracks
     my $processedChanged = 0; # progress counter for changed tracks
-    my %albumSeen;       # distinct album ids
+    my %albumSeen;       # distinct album ids (only if debugContrib)
     my $albumSamplesLogged = 0;
     # Process new tracks first
     for my $url (@newUrls) {
         my $row = $alibCache->{$url};
-        if (!$existing{$url}) { # always true here, defensive
-            # Create new track using our hook for metadata (no filesystem access)
-            eval {
-                my $trackId = Slim::Schema->updateOrCreateBase({
-                    url        => $url,
-                    readTags   => 1,      # Use our hook, not filesystem
-                    new        => 1,       # This is a new track
-                    checkMTime => 0,       # Don't check filesystem mtime
-                    commit     => 0,       # Don't commit yet - let scanner control this
-                });
-                
-                if ($trackId) {
-                    $changes++;
-                    $count++;
-                    $processedNew++;
-                    # Populate samplesize (bit depth) from alib if available and not already set
-                    if (defined $row->{__bitspersample} && $row->{__bitspersample} =~ /^(\d+)$/) {
-                        my $bps = $1;
-                        my $trackObj = Slim::Schema->rs('Track')->find($trackId);
-                        if ($trackObj && !$trackObj->samplesize) {
-                            $trackObj->set_column('samplesize', $bps);
-                            eval { $trackObj->update; }; $log->warn("AlibScanner: failed to update samplesize for track $trackId url=$url: $@") if $@;
-                        }
+        eval {
+            my $trackId = Slim::Schema->updateOrCreateBase({
+                url        => $url,
+                readTags   => 1,
+                new        => 1,
+                checkMTime => 0,
+                commit     => 0,
+            });
+            if ($trackId) {
+                $changes++;
+                $count++;
+                $processedNew++;
+                if (defined $row->{__bitspersample} && $row->{__bitspersample} =~ /^(\d+)$/) {
+                    my $bps = $1;
+                    my $trackObj = Slim::Schema->rs('Track')->find($trackId);
+                    if ($trackObj && !$trackObj->samplesize) {
+                        $trackObj->set_column('samplesize', $bps);
+                        eval { $trackObj->update; }; $log->warn("AlibScanner: failed to update samplesize for track $trackId url=$url: $@") if $@;
                     }
-                    # Fetch album id for diagnosis
+                }
+                if ($debugContrib) {
                     my $dbh2 = Slim::Schema->dbh;
-                    my ($albumId) = $dbh2->selectrow_array("SELECT album FROM tracks WHERE id=?", undef, $trackId);
-                    if (defined $albumId && $albumId) {
-                        $albumSeen{$albumId}++;
-                        # Log first few samples only when debugPlaceholders enabled
-                        if ($debugContrib && $albumSamplesLogged < 5) {
-                            $log->error("ALBUMTRACE track=$trackId album=$albumId url=$url");
-                            $albumSamplesLogged++;
-                        }
-                    }
-
-                    # Instrumentation: detect placeholder contributor names appearing under wrong roles
-                    if ($trackId && $debugContrib) {
-                        my $sthP = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
-                        eval { $sthP->execute($trackId); };
-                        if (!$@) {
-                            my $rawComposer = $alibCache->{$url}->{composer};
-                            my $rawConductor = $alibCache->{$url}->{conductor};
-                            while (my ($r,$n) = $sthP->fetchrow_array) {
-                                if ($anomalyChecks && $n =~ /^(ARTIST|ALBUMARTIST|TRACKARTIST|COMPOSER|CONDUCTOR|BAND|PERFORMER|LYRICIST|ARRANGER|ENGINEER|PRODUCER|MIXER|REMIXER)$/i && $r !~ /^[1-6]$/) {
-                                    $log->error("PLACEHOLDERTRACE unexpected roleMap track=$trackId url=$url role=$r name=$n");
-                                }
-                                # Detect cross-role: name equals different role label than numeric role mapping
-                                if ($anomalyChecks && $n =~ /^(COMPOSER|CONDUCTOR|LYRICIST|PERFORMER)$/i) {
-                                    $log->error("PLACEHOLDERTRACE contributor track=$trackId role=$r name=$n") if $n =~ /^CONDUCTOR$/i && $r != 3;
-                                }
-                                if ($anomalyChecks && $n =~ /^CONDUCTOR$/i && $r == 2) {
-                                    $log->error("COMPOSER_ANOMALY track=$trackId url=$url composerContributorName=CONDUCTOR rawComposer='" . (defined $rawComposer ? $rawComposer : '') . "' rawConductor='" . (defined $rawConductor ? $rawConductor : '') . "'");
-                                }
+                    my $sthAlbum = _cached_sth('SELECT album FROM tracks WHERE id=?');
+                    eval { $sthAlbum->execute($trackId); };
+                    if (!$@) {
+                        my ($albumId) = $sthAlbum->fetchrow_array;
+                        if (defined $albumId && $albumId) {
+                            $albumSeen{$albumId}++;
+                            if ($albumSamplesLogged < 5) {
+                                $log->error("ALBUMTRACE track=$trackId album=$albumId url=$url");
+                                $albumSamplesLogged++;
                             }
-                            $sthP->finish;
                         }
-                        # Additional correlation: log sanitized contributor tag arrays vs DB rows
-                        eval {
-                            my $tags = Slim::Formats::readTags($url) || {};
-                            my @ctags = qw(ARTIST ALBUMARTIST COMPOSER CONDUCTOR LYRICIST ARRANGER BAND PERFORMER ENGINEER PRODUCER MIXER REMIXER);
-                            my %dump;
-                            for my $k (@ctags) {
-                                next unless exists $tags->{$k};
-                                my $v = $tags->{$k};
-                                my $ref = ref $v;
-                                my $out = $ref eq 'ARRAY' ? join('|', @$v) : (defined $v ? $v : '');
-                                $dump{$k} = $out if defined $out && length $out;
-                            }
-                            my $tagDump = join(' ', map { $_ . "='" . $dump{$_} . "'" } sort keys %dump);
-                            $log->error("TRACKCONTRIBTRACE tags track=$trackId url=$url $tagDump");
-                            my $sthDb = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
-                            $sthDb->execute($trackId);
-                            my @pairs;
-                            while (my ($r,$n) = $sthDb->fetchrow_array) { push @pairs, $r . ':' . $n; }
-                            $sthDb->finish;
-                            $log->error("TRACKCONTRIBTRACE db track=$trackId url=$url roles=" . join('|', @pairs));
-                        }; $log->warn("TRACKCONTRIBTRACE error (new track) url=$url: $@") if $@;
-                        # Separator line between track log blocks
-                        $log->error('-' x 80);
                     }
                 }
-            };
-            
-            if ($@) {
-                $log->error("Error processing $url: $@");
+                if ($trackId && $debugContrib) {
+                    my $sthP = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
+                    eval { $sthP->execute($trackId); };
+                    if (!$@) {
+                        my $rawComposer = $alibCache->{$url}->{composer};
+                        my $rawConductor = $alibCache->{$url}->{conductor};
+                        while (my ($r,$n) = $sthP->fetchrow_array) {
+                            if ($anomalyChecks && $n =~ /^(ARTIST|ALBUMARTIST|TRACKARTIST|COMPOSER|CONDUCTOR|BAND|PERFORMER|LYRICIST|ARRANGER|ENGINEER|PRODUCER|MIXER|REMIXER)$/i && $r !~ /^[1-6]$/) {
+                                $log->error("PLACEHOLDERTRACE unexpected roleMap track=$trackId url=$url role=$r name=$n");
+                            }
+                            if ($anomalyChecks && $n =~ /^(COMPOSER|CONDUCTOR|LYRICIST|PERFORMER)$/i) {
+                                $log->error("PLACEHOLDERTRACE contributor track=$trackId role=$r name=$n") if $n =~ /^CONDUCTOR$/i && $r != 3;
+                            }
+                            if ($anomalyChecks && $n =~ /^CONDUCTOR$/i && $r == 2) {
+                                $log->error("COMPOSER_ANOMALY track=$trackId url=$url composerContributorName=CONDUCTOR rawComposer='" . (defined $rawComposer ? $rawComposer : '') . "' rawConductor='" . (defined $rawConductor ? $rawConductor : '') . "'");
+                            }
+                        }
+                        $sthP->finish;
+                    }
+                    eval {
+                        my $tags = Slim::Formats::readTags($url) || {};
+                        my @ctags = qw(ARTIST ALBUMARTIST COMPOSER CONDUCTOR LYRICIST ARRANGER BAND PERFORMER ENGINEER PRODUCER MIXER REMIXER);
+                        my %dump;
+                        for my $k (@ctags) {
+                            next unless exists $tags->{$k};
+                            my $v = $tags->{$k};
+                            my $ref = ref $v;
+                            my $out = $ref eq 'ARRAY' ? join('|', @$v) : (defined $v ? $v : '');
+                            $dump{$k} = $out if defined $out && length $out;
+                        }
+                        my $tagDump = join(' ', map { $_ . "='" . $dump{$_} . "'" } sort keys %dump);
+                        $log->error("TRACKCONTRIBTRACE tags track=$trackId url=$url $tagDump");
+                        my $sthDb = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
+                        $sthDb->execute($trackId);
+                        my @pairs;
+                        while (my ($r,$n) = $sthDb->fetchrow_array) { push @pairs, $r . ':' . $n; }
+                        $sthDb->finish;
+                        $log->error("TRACKCONTRIBTRACE db track=$trackId url=$url roles=" . join('|', @pairs));
+                    }; $log->warn("TRACKCONTRIBTRACE error (new track) url=$url: $@") if $@;
+                    $log->error('-' x 80);
+                }
             }
-            
-                # Commit every 500 tracks to avoid corruption
-                if ($processedNew % 500 == 0) {
-                    Slim::Schema->forceCommit;
-                    my $distinctAlbums = scalar keys %albumSeen;
-                    $log->error("Processed new $processedNew / $newTotal (added=$count) changed=$updated distinctAlbums=$distinctAlbums");
-                    eval { $progressNew->update(undef, $processedNew) };
-                }
-        }
-        # Progress update every 500 new tracks
+        };
+        if ($@) { $log->error("Error processing $url: $@"); }
         if ($processedNew % 500 == 0) {
+            Slim::Schema->forceCommit;
+            my $distinctAlbums = $debugContrib ? scalar keys %albumSeen : 0;
+            $log->error("Processed new $processedNew / $newTotal (added=$count) changed=$updated" . ($debugContrib ? " distinctAlbums=$distinctAlbums" : ''));
             eval { $progressNew->update(undef, $processedNew) };
         }
     }
+    # Extra boundary update if final count divisible by 500
+    if ($processedNew % 500 == 0) { eval { $progressNew->update(undef, $processedNew) }; }
 
     # Process changed tracks
     for my $url (@changedUrls) {
@@ -509,8 +496,8 @@ sub _processAllTracks {
 
         if ($processedChanged % 500 == 0) {
             Slim::Schema->forceCommit;
-            my $distinctAlbums = scalar keys %albumSeen;
-            $log->error("Processed changed $processedChanged / $changedTotal (added=$count updated=$updated) distinctAlbums=$distinctAlbums");
+            my $distinctAlbums = $debugContrib ? scalar keys %albumSeen : 0;
+            $log->error("Processed changed $processedChanged / $changedTotal (added=$count updated=$updated" . ($debugContrib ? " distinctAlbums=$distinctAlbums" : '') . ")");
             eval { $progressChanged && $progressChanged->update(undef, $processedChanged) };
         }
     }
@@ -519,9 +506,11 @@ sub _processAllTracks {
     Slim::Schema->forceCommit;
     eval { $progressNew->update(undef, $processedNew); $progressNew->final($processedNew); };
     eval { $progressChanged && $progressChanged->update(undef, $processedChanged); $progressChanged && $progressChanged->final($processedChanged); };
-    my $finalDistinctAlbums = scalar keys %albumSeen;
-    my $processedTotal = $processedNew + $processedChanged;
-    $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged) added=$count updated=$updated totalProcessed=$processedTotal newProcessed=$processedNew changedProcessed=$processedChanged") if $debugContrib;
+    if ($debugContrib) {
+        my $finalDistinctAlbums = scalar keys %albumSeen;
+        my $processedTotal = $processedNew + $processedChanged;
+        $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged) added=$count updated=$updated totalProcessed=$processedTotal newProcessed=$processedNew changedProcessed=$processedChanged");
+    }
 
     # Deletion pass: remove tracks no longer present in alib
     my @deleted;
