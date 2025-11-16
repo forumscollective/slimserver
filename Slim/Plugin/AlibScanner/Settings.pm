@@ -16,7 +16,7 @@ sub page {
 }
 
 sub prefs {
-    return ($prefs, qw(enabled alibdb));
+    return ($prefs, qw(enabled alibdb debugPlaceholders debugPlaceholdersVerbose anomalyChecksEnabled));
 }
 
 1;

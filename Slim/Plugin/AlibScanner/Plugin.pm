@@ -18,6 +18,9 @@ my $prefs = preferences('plugin.alibscanner');
 $prefs->init({
     alibdb => '',
     enabled => 0,
+    debugPlaceholders => 0, # instrumentation toggle for contributor anomalies
+    debugPlaceholdersVerbose => 0, # high-volume diagnostic traces
+    anomalyChecksEnabled => 0, # baseline anomaly checks disabled by default
 });
 
 sub initPlugin {

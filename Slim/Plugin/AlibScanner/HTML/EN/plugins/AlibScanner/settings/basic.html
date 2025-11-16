@@ -25,6 +25,39 @@
     <div class="settingSection">
         <div class="settingGroup">
             <div class="setting">
+                <input type="checkbox" name="pref_debugPlaceholders" id="pref_debugPlaceholders" value="1"
+                       [% IF prefs.pref_debugPlaceholders %]checked[% END %] class="stdedit" />
+                <label for="pref_debugPlaceholders">[% "PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS" | string %]</label>
+            </div>
+            <div class="prefDesc">[% "PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS_DESC" | string %]</div>
+        </div>
+    </div>
+
+    <div class="settingSection">
+        <div class="settingGroup">
+            <div class="setting">
+                <input type="checkbox" name="pref_debugPlaceholdersVerbose" id="pref_debugPlaceholdersVerbose" value="1"
+                       [% IF prefs.pref_debugPlaceholdersVerbose %]checked[% END %] class="stdedit" />
+                <label for="pref_debugPlaceholdersVerbose">[% "PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS_VERBOSE" | string %]</label>
+            </div>
+            <div class="prefDesc">[% "PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS_VERBOSE_DESC" | string %]</div>
+        </div>
+    </div>
+
+    <div class="settingSection">
+        <div class="settingGroup">
+            <div class="setting">
+                <input type="checkbox" name="pref_anomalyChecksEnabled" id="pref_anomalyChecksEnabled" value="1"
+                       [% IF prefs.pref_anomalyChecksEnabled %]checked[% END %] class="stdedit" />
+                <label for="pref_anomalyChecksEnabled">[% "PLUGIN_ALIBSCANNER_ANOMALY_CHECKS" | string %]</label>
+            </div>
+            <div class="prefDesc">[% "PLUGIN_ALIBSCANNER_ANOMALY_CHECKS_DESC" | string %]</div>
+        </div>
+    </div>
+
+    <div class="settingSection">
+        <div class="settingGroup">
+            <div class="setting">
                 <div class="label">
                     <label for="alibdb">[% "PLUGIN_ALIBSCANNER_ALIBDB" | string %]:</label>
                 </div>

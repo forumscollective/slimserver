@@ -16,3 +16,21 @@ PLUGIN_ALIBSCANNER_ENABLED
 PLUGIN_ALIBSCANNER_ENABLED_DESC
 	EN	When enabled, metadata will be read from alib database instead of scanning files
 
+PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS
+	EN	Debug Placeholder Contributors
+
+PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS_DESC
+	EN	Log composer/conductor anomalies (e.g. 'CONDUCTOR' appearing as composer). Use only for troubleshooting; may increase log volume.
+
+PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS_VERBOSE
+	EN	Verbose Placeholder Diagnostics
+
+PLUGIN_ALIBSCANNER_DEBUG_PLACEHOLDERS_VERBOSE_DESC
+	EN	Enable high-volume placeholder trace logs (SPLITTRACE, PRECONSTRUCTTRACE, CONTRIB_STAGE1, CONTRIB_SENTINELS, TAGTRACE). Only use for deep troubleshooting.
+
+PLUGIN_ALIBSCANNER_ANOMALY_CHECKS
+	EN	Enable Baseline Anomaly Checks
+
+PLUGIN_ALIBSCANNER_ANOMALY_CHECKS_DESC
+	EN	Turn off to suppress baseline contributor anomaly detection (ASSIGN_SHIFT, ASSIGN_PLACEHOLDER, ROLEMISMATCH, CONDUCTOR_MISMATCH). Keeps scanning lightweight when stable.
+
