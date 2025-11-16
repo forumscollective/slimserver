@@ -369,6 +369,15 @@ sub _processAllTracks {
                     $changes++;
                     $count++;
                     $processedNew++;
+                    # Populate samplesize (bit depth) from alib if available and not already set
+                    if (defined $row->{__bitspersample} && $row->{__bitspersample} =~ /^(\d+)$/) {
+                        my $bps = $1;
+                        my $trackObj = Slim::Schema->rs('Track')->find($trackId);
+                        if ($trackObj && !$trackObj->samplesize) {
+                            $trackObj->set_column('samplesize', $bps);
+                            eval { $trackObj->update; }; $log->warn("AlibScanner: failed to update samplesize for track $trackId url=$url: $@") if $@;
+                        }
+                    }
                     # Fetch album id for diagnosis
                     my $dbh2 = Slim::Schema->dbh;
                     my ($albumId) = $dbh2->selectrow_array("SELECT album FROM tracks WHERE id=?", undef, $trackId);
@@ -460,6 +469,21 @@ sub _processAllTracks {
             if ($trackObjOrId) {
                 $updated++;
                 $processedChanged++;
+                # Populate samplesize for changed tracks if now present
+                my $row = $alibCache->{$url};
+                if ($row && defined $row->{__bitspersample} && $row->{__bitspersample} =~ /^(\d+)$/) {
+                    my $bps = $1;
+                    my $trackObj;
+                    if (blessed($trackObjOrId)) {
+                        $trackObj = $trackObjOrId;
+                    } else {
+                        $trackObj = Slim::Schema->rs('Track')->find($trackObjOrId);
+                    }
+                    if ($trackObj && !$trackObj->samplesize) {
+                        $trackObj->set_column('samplesize', $bps);
+                        eval { $trackObj->update; }; $log->warn("AlibScanner: failed to update samplesize for changed track url=$url: $@") if $@;
+                    }
+                }
                 if ($prefs->get('debugPlaceholders')) {
                     my $dbh2 = Slim::Schema->dbh;
                     my $idLookup = $dbh2->prepare('SELECT id FROM tracks WHERE url=?');
