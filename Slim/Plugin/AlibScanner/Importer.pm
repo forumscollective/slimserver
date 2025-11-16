@@ -268,28 +268,13 @@ sub _processAllTracks {
             $log->warn("AlibScanner: failed to preload existing URLs: $@");
         }
         else {
-            while (my ($eurl) = $sth->fetchrow_array) { $existing{$eurl} = 1; }
+            while (my ($eurl) = $sth->fetchrow_array) {
+                # Canonicalize URL the same way we do for alib entries to avoid false 'new' classifications
+                my $canon = Slim::Utils::Misc::fixPath($eurl);
+                $existing{$canon} = 1;
+            }
             $sth->finish;
             $log->info('AlibScanner: preloaded existing track URL hash size=' . scalar(keys %existing));
-        }
-
-        # Preload existing composer contributor sets to detect removals or changes not flagged by sqlmodded
-        my $compSTH = $dbh->prepare(q{
-            SELECT t.url, GROUP_CONCAT(c.name, '\x1F') AS composers
-            FROM tracks t
-            JOIN contributor_track ct ON t.id = ct.track AND ct.role = 2
-            JOIN contributors c ON ct.contributor = c.id
-            GROUP BY t.url
-        });
-        eval { $compSTH->execute(); };
-        if ($@) {
-            $log->warn("AlibScanner: failed to preload composer sets: $@");
-        }
-        else {
-            while (my ($curl, $names) = $compSTH->fetchrow_array) {
-                $existing{"_COMPOSERS_$curl"} = $names; # store separately with prefix key
-            }
-            $compSTH->finish;
         }
     }
 
@@ -300,28 +285,9 @@ sub _processAllTracks {
             push @newUrls, $url;
         }
         else {
-            my $markedChanged;
             if ($row && defined $row->{sqlmodded} && $row->{sqlmodded} > 0) {
-                $markedChanged = 1;
+                push @changedUrls, $url;
             }
-            # Detect composer set differences even if sqlmodded not flagged
-            my $dbComposerSet = $existing{"_COMPOSERS_$url"};
-            my $alibComposerRaw = $row->{composer};
-            my @alibComposers;
-            if (defined $alibComposerRaw && length $alibComposerRaw) {
-                @alibComposers = grep { length $_ } map { my $v = $_; $v =~ s/^\s+|\s+$//g; $v } split /\\\\/, $alibComposerRaw;
-            }
-            my @dbComposers = defined $dbComposerSet ? split(/\x1F/, $dbComposerSet) : (); # stored separator
-            # Normalize case and sort for comparison
-            my $normAlib = join('\x1E', sort map { lc $_ } @alibComposers);
-            my $normDb   = join('\x1E', sort map { lc $_ } @dbComposers);
-            if (!$markedChanged) {
-                if ($normAlib ne $normDb) {
-                    $markedChanged = 1;
-                    $log->info("AlibScanner: composer delta detected url=$url db=['$normDb'] alib=['$normAlib'] marking changed");
-                }
-            }
-            push @changedUrls, $url if $markedChanged;
         }
     }
     my $newTotal = scalar @newUrls;
@@ -450,16 +416,17 @@ sub _processAllTracks {
                 $log->error("Error processing $url: $@");
             }
             
-            # Commit every 500 tracks to avoid corruption
-            if ($processedNew % 500 == 0) {
-                Slim::Schema->forceCommit;
-                my $distinctAlbums = scalar keys %albumSeen;
-                $log->error("Processed new $processedNew / $newTotal (added=$count) changed=$updated distinctAlbums=$distinctAlbums");
-            }
+                # Commit every 500 tracks to avoid corruption
+                if ($processedNew % 500 == 0) {
+                    Slim::Schema->forceCommit;
+                    my $distinctAlbums = scalar keys %albumSeen;
+                    $log->error("Processed new $processedNew / $newTotal (added=$count) changed=$updated distinctAlbums=$distinctAlbums");
+                    eval { $progressNew->update(undef, $processedNew) };
+                }
         }
         # Progress update every 500 new tracks
         if ($processedNew % 500 == 0) {
-            eval { $progressNew->update($processedNew) };
+            eval { $progressNew->update(undef, $processedNew) };
         }
     }
 
@@ -544,14 +511,14 @@ sub _processAllTracks {
             Slim::Schema->forceCommit;
             my $distinctAlbums = scalar keys %albumSeen;
             $log->error("Processed changed $processedChanged / $changedTotal (added=$count updated=$updated) distinctAlbums=$distinctAlbums");
-            eval { $progressChanged && $progressChanged->update($processedChanged) };
+            eval { $progressChanged && $progressChanged->update(undef, $processedChanged) };
         }
     }
     
     # Final commit
     Slim::Schema->forceCommit;
-    eval { $progressNew->update($processedNew); $progressNew->final; };
-    eval { $progressChanged && $progressChanged->update($processedChanged); $progressChanged && $progressChanged->final; };
+    eval { $progressNew->update(undef, $processedNew); $progressNew->final($processedNew); };
+    eval { $progressChanged && $progressChanged->update(undef, $processedChanged); $progressChanged && $progressChanged->final($processedChanged); };
     my $finalDistinctAlbums = scalar keys %albumSeen;
     my $processedTotal = $processedNew + $processedChanged;
     $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged) added=$count updated=$updated totalProcessed=$processedTotal newProcessed=$processedNew changedProcessed=$processedChanged") if $debugContrib;
@@ -589,11 +556,11 @@ sub _processAllTracks {
                 $d++;
                 # update progress every 250 deletions to reduce DB churn
                 if ($d % 250 == 0) {
-                    eval { $delProgress->update($d); };
+                    eval { $delProgress->update(undef, $d); };
                 }
             }
             # finalize deletion progress
-            eval { $delProgress->update($d); $delProgress->final; };
+            eval { $delProgress->update(undef, $d); $delProgress->final($d); };
             Slim::Schema->forceCommit;
             $log->error("AlibScanner: deletion pass complete removed=$d");
             $changes += $deletedCount; # count deletions as changes
