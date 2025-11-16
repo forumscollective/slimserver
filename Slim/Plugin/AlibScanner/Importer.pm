@@ -20,9 +20,17 @@ use Slim::Schema;
 use Slim::Formats;
 use Slim::Utils::Progress;
 use Storable qw();
+use Scalar::Util qw(blessed);
 
 my $log = logger('plugin.alibscanner');
 my $prefs = preferences('plugin.alibscanner');
+
+# Statement handle cache to reduce prepare() overhead
+my %STH_CACHE;
+sub _cached_sth {
+    my ($sql) = @_;
+    return $STH_CACHE{$sql} ||= Slim::Schema->dbh->prepare($sql);
+}
 
 # Cache for alib database handle and data
 my $alibDbh;
@@ -392,9 +400,7 @@ sub _processAllTracks {
 
                     # Instrumentation: detect placeholder contributor names appearing under wrong roles
                     if ($trackId && $debugContrib) {
-                        my $sthP = $dbh2->prepare(q{
-                            SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?
-                        });
+                        my $sthP = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
                         eval { $sthP->execute($trackId); };
                         if (!$@) {
                             my $rawComposer = $alibCache->{$url}->{composer};
@@ -427,7 +433,7 @@ sub _processAllTracks {
                             }
                             my $tagDump = join(' ', map { $_ . "='" . $dump{$_} . "'" } sort keys %dump);
                             $log->error("TRACKCONTRIBTRACE tags track=$trackId url=$url $tagDump");
-                            my $sthDb = $dbh2->prepare(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
+                            my $sthDb = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
                             $sthDb->execute($trackId);
                             my @pairs;
                             while (my ($r,$n) = $sthDb->fetchrow_array) { push @pairs, $r . ':' . $n; }
@@ -486,15 +492,13 @@ sub _processAllTracks {
                 }
                 if ($prefs->get('debugPlaceholders')) {
                     my $dbh2 = Slim::Schema->dbh;
-                    my $idLookup = $dbh2->prepare('SELECT id FROM tracks WHERE url=?');
+                    my $idLookup = _cached_sth('SELECT id FROM tracks WHERE url=?');
                     eval { $idLookup->execute($url); };
                     if (!$@) {
                         my ($tid) = $idLookup->fetchrow_array;
                         $idLookup->finish;
                         if ($tid) {
-                            my $sthP = $dbh2->prepare(q{
-                                SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?
-                            });
+                            my $sthP = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
                             eval { $sthP->execute($tid); };
                             if (!$@) {
                                 while (my ($r,$n) = $sthP->fetchrow_array) {
@@ -518,7 +522,7 @@ sub _processAllTracks {
                                 }
                                 my $tagDump = join(' ', map { $_ . "='" . $dump{$_} . "'" } sort keys %dump);
                                 $log->error("TRACKCONTRIBTRACE tags track=$tid url=$url $tagDump");
-                                my $sthDb = $dbh2->prepare(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
+                                my $sthDb = _cached_sth(q{SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?});
                                 $sthDb->execute($tid);
                                 my @pairs;
                                 while (my ($r,$n) = $sthDb->fetchrow_array) { push @pairs, $r . ':' . $n; }
