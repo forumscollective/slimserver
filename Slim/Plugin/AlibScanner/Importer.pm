@@ -146,8 +146,59 @@ sub startScan {
 
 sub _loadAlibCache {
     $log->error("DEBUG: _loadAlibCache() called");
-    my $sth = $alibDbh->prepare("SELECT * FROM alib");
-    $sth->execute();
+    # Discover available columns to guard against schema variance and avoid SELECT *
+    my $ti = eval { $alibDbh->selectall_arrayref('PRAGMA table_info(alib)') };
+    my %have;
+    if ($ti) {
+        for my $col (@$ti) {
+            # PRAGMA table_info returns: cid,name,type,notnull,dflt_value,pk
+            my $name = $col->[1];
+            $have{$name} = 1 if defined $name;
+        }
+    }
+
+    my @wanted = qw(
+        __path title __filename_no_ext album track discnumber disc year originalyear
+        artist albumartist composer conductor lyricist writer arranger ensemble performer
+        engineer producer mixer remixer genre style mood musicbrainz_trackid musicbrainz_albumid
+        musicbrainz_artistid musicbrainz_albumartistid musicbrainz_releasegroupid musicbrainz_workid
+        work movement part compilation label releasetype catalognumber catalog barcode asin
+        lyrics unsyncedlyrics subtitle discsubtitle grouping rating bpm isrc comment
+        replaygain_track_gain replaygain_track_peak replaygain_album_gain replaygain_album_peak
+        __ext __file_size_bytes __file_mtime __length_seconds __bitrate __bitrate_num __frequency
+        __frequency_num __channels __bitspersample __mode sqlmodded
+    );
+
+    # Filter to existing columns only (grouping may be absent etc.)
+    my @cols = grep { $have{$_} } @wanted;
+    unless (@cols) {
+        $log->error('AlibScanner: no expected columns found in alib schema; aborting cache load');
+        return;
+    }
+    if (!$have{'__path'}) {
+        $log->error('AlibScanner: required column __path missing; cannot proceed');
+        return;
+    }
+    my @missing = grep { !$have{$_} } @wanted;
+    if (@missing) {
+        $log->info('AlibScanner: skipping absent alib columns: ' . join(',', @missing));
+    }
+    my $sql = 'SELECT ' . join(',', @cols) . ' FROM alib';
+    my $sth = eval { $alibDbh->prepare($sql) };
+    if (!$sth) {
+        $log->error('AlibScanner: prepare failed for selective column query, falling back to SELECT *: ' . ($@||'unknown error'));
+        $sth = $alibDbh->prepare('SELECT * FROM alib');
+    }
+    eval { $sth->execute(); };
+    if ($@) {
+        $log->error('AlibScanner: execute failed for selective column query, falling back to SELECT *: ' . $@);
+        $sth = $alibDbh->prepare('SELECT * FROM alib');
+        eval { $sth->execute(); };
+        if ($@) {
+            $log->error('AlibScanner: fallback SELECT * failed: ' . $@);
+            return;
+        }
+    }
 
     my $dbRows = 0;
     my $cacheEntries = 0;
@@ -286,6 +337,11 @@ sub _processAllTracks {
         });
     }
     
+    # Early cache of logging prefs to avoid repeated lookups in tight loops
+    my $debugContrib  = $prefs->get('debugPlaceholders');
+    my $debugVerbose  = $debugContrib ? $prefs->get('debugPlaceholdersVerbose') : 0;
+    my $anomalyChecks = $debugContrib ? $prefs->get('anomalyChecksEnabled') : 0;
+
     $log->error("Found $total tracks in alib (new=$newTotal changed=$changedTotal) to process");
     
     # Process each track
@@ -319,14 +375,14 @@ sub _processAllTracks {
                     if (defined $albumId && $albumId) {
                         $albumSeen{$albumId}++;
                         # Log first few samples only when debugPlaceholders enabled
-                        if ($prefs->get('debugPlaceholders') && $albumSamplesLogged < 5) {
+                        if ($debugContrib && $albumSamplesLogged < 5) {
                             $log->error("ALBUMTRACE track=$trackId album=$albumId url=$url");
                             $albumSamplesLogged++;
                         }
                     }
 
                     # Instrumentation: detect placeholder contributor names appearing under wrong roles
-                    if ($trackId && $prefs->get('debugPlaceholders')) {
+                    if ($trackId && $debugContrib) {
                         my $sthP = $dbh2->prepare(q{
                             SELECT ct.role, c.name FROM contributor_track ct JOIN contributors c ON ct.contributor=c.id WHERE ct.track=?
                         });
@@ -335,14 +391,14 @@ sub _processAllTracks {
                             my $rawComposer = $alibCache->{$url}->{composer};
                             my $rawConductor = $alibCache->{$url}->{conductor};
                             while (my ($r,$n) = $sthP->fetchrow_array) {
-                                if ($n =~ /^(ARTIST|ALBUMARTIST|TRACKARTIST|COMPOSER|CONDUCTOR|BAND|PERFORMER|LYRICIST|ARRANGER|ENGINEER|PRODUCER|MIXER|REMIXER)$/i && $r !~ /^[1-6]$/) {
+                                if ($anomalyChecks && $n =~ /^(ARTIST|ALBUMARTIST|TRACKARTIST|COMPOSER|CONDUCTOR|BAND|PERFORMER|LYRICIST|ARRANGER|ENGINEER|PRODUCER|MIXER|REMIXER)$/i && $r !~ /^[1-6]$/) {
                                     $log->error("PLACEHOLDERTRACE unexpected roleMap track=$trackId url=$url role=$r name=$n");
                                 }
                                 # Detect cross-role: name equals different role label than numeric role mapping
-                                if ($n =~ /^(COMPOSER|CONDUCTOR|LYRICIST|PERFORMER)$/i) {
+                                if ($anomalyChecks && $n =~ /^(COMPOSER|CONDUCTOR|LYRICIST|PERFORMER)$/i) {
                                     $log->error("PLACEHOLDERTRACE contributor track=$trackId role=$r name=$n") if $n =~ /^CONDUCTOR$/i && $r != 3;
                                 }
-                                if ($n =~ /^CONDUCTOR$/i && $r == 2) {
+                                if ($anomalyChecks && $n =~ /^CONDUCTOR$/i && $r == 2) {
                                     $log->error("COMPOSER_ANOMALY track=$trackId url=$url composerContributorName=CONDUCTOR rawComposer='" . (defined $rawComposer ? $rawComposer : '') . "' rawConductor='" . (defined $rawConductor ? $rawConductor : '') . "'");
                                 }
                             }
@@ -470,7 +526,7 @@ sub _processAllTracks {
     eval { $progressChanged && $progressChanged->update($processedChanged); $progressChanged && $progressChanged->final; };
     my $finalDistinctAlbums = scalar keys %albumSeen;
     my $processedTotal = $processedNew + $processedChanged;
-    $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged) added=$count updated=$updated totalProcessed=$processedTotal newProcessed=$processedNew changedProcessed=$processedChanged");
+    $log->error("ALBUMTRACE final distinct album ids=$finalDistinctAlbums (sample logged=$albumSamplesLogged) added=$count updated=$updated totalProcessed=$processedTotal newProcessed=$processedNew changedProcessed=$processedChanged") if $debugContrib;
 
     # Deletion pass: remove tracks no longer present in alib
     my @deleted;
@@ -718,25 +774,25 @@ sub _getAlibMetadata {
     $tags->{YEAR}     = $alibRow->{year} || $alibRow->{originalyear};
     $tags->{DATE}     = $alibRow->{originaldate} || $alibRow->{originalreleasedate};
 
-    my @contribBuild = (
-        [ ARTIST      => sub { _splitMultiValue($alibRow->{artist}) } ],
-        [ ALBUMARTIST => sub { _splitMultiValue($alibRow->{albumartist}) } ],
-        [ COMPOSER    => sub { _splitMultiValue($alibRow->{composer}) } ],
-        [ CONDUCTOR   => sub { _splitMultiValue($alibRow->{conductor}) } ],
-        [ LYRICIST    => sub { _splitMultiValue($alibRow->{lyricist} || $alibRow->{writer}) } ],
-        [ ARRANGER    => sub { _splitMultiValue($alibRow->{arranger}) } ],
-        [ BAND        => sub { _splitMultiValue($alibRow->{ensemble}) } ],
-        [ PERFORMER   => sub { _splitMultiValue($alibRow->{performer}) } ],
-        [ ENGINEER    => sub { _splitMultiValue($alibRow->{engineer}) } ],
-        [ PRODUCER    => sub { _splitMultiValue($alibRow->{producer}) } ],
-        [ MIXER       => sub { _splitMultiValue($alibRow->{mixer}) } ],
-        [ REMIXER     => sub { _splitMultiValue($alibRow->{remixer}) } ],
-        [ GENRE       => sub { _splitMultiValue($alibRow->{genre}) } ],
-        [ STYLE       => sub { _splitMultiValue($alibRow->{style}) } ],
-        [ MOOD        => sub { _splitMultiValue($alibRow->{mood}) } ],
-    );
-
+    # EARLY SHORT-CIRCUIT: if contributor debug disabled, avoid building closure array
     if ($prefs->get('debugPlaceholders')) {
+        my @contribBuild = (
+            [ ARTIST      => sub { _splitMultiValue($alibRow->{artist}) } ],
+            [ ALBUMARTIST => sub { _splitMultiValue($alibRow->{albumartist}) } ],
+            [ COMPOSER    => sub { _splitMultiValue($alibRow->{composer}) } ],
+            [ CONDUCTOR   => sub { _splitMultiValue($alibRow->{conductor}) } ],
+            [ LYRICIST    => sub { _splitMultiValue($alibRow->{lyricist} || $alibRow->{writer}) } ],
+            [ ARRANGER    => sub { _splitMultiValue($alibRow->{arranger}) } ],
+            [ BAND        => sub { _splitMultiValue($alibRow->{ensemble}) } ],
+            [ PERFORMER   => sub { _splitMultiValue($alibRow->{performer}) } ],
+            [ ENGINEER    => sub { _splitMultiValue($alibRow->{engineer}) } ],
+            [ PRODUCER    => sub { _splitMultiValue($alibRow->{producer}) } ],
+            [ MIXER       => sub { _splitMultiValue($alibRow->{mixer}) } ],
+            [ REMIXER     => sub { _splitMultiValue($alibRow->{remixer}) } ],
+            [ GENRE       => sub { _splitMultiValue($alibRow->{genre}) } ],
+            [ STYLE       => sub { _splitMultiValue($alibRow->{style}) } ],
+            [ MOOD        => sub { _splitMultiValue($alibRow->{mood}) } ],
+        );
         my $verbose = $prefs->get('debugPlaceholdersVerbose');
         my $anomalyEnabled = $prefs->get('anomalyChecksEnabled');
         for (my $i = 0; $i < @contribBuild; $i++) {
@@ -765,8 +821,22 @@ sub _getAlibMetadata {
         }
     }
     else {
-        # Non-debug fast path
-        for my $entry (@contribBuild) { my ($role,$code)=@$entry; $tags->{$role} = $code->(); }
+        # Non-debug fast path: direct assignments without closure indirection
+        $tags->{ARTIST}      = _splitMultiValue($alibRow->{artist});
+        $tags->{ALBUMARTIST} = _splitMultiValue($alibRow->{albumartist});
+        $tags->{COMPOSER}    = _splitMultiValue($alibRow->{composer});
+        $tags->{CONDUCTOR}   = _splitMultiValue($alibRow->{conductor});
+        $tags->{LYRICIST}    = _splitMultiValue($alibRow->{lyricist} || $alibRow->{writer});
+        $tags->{ARRANGER}    = _splitMultiValue($alibRow->{arranger});
+        $tags->{BAND}        = _splitMultiValue($alibRow->{ensemble});
+        $tags->{PERFORMER}   = _splitMultiValue($alibRow->{performer});
+        $tags->{ENGINEER}    = _splitMultiValue($alibRow->{engineer});
+        $tags->{PRODUCER}    = _splitMultiValue($alibRow->{producer});
+        $tags->{MIXER}       = _splitMultiValue($alibRow->{mixer});
+        $tags->{REMIXER}     = _splitMultiValue($alibRow->{remixer});
+        $tags->{GENRE}       = _splitMultiValue($alibRow->{genre});
+        $tags->{STYLE}       = _splitMultiValue($alibRow->{style});
+        $tags->{MOOD}        = _splitMultiValue($alibRow->{mood});
     }
 
     # MusicBrainz & other ancillary tags (unchanged from previous logic)
