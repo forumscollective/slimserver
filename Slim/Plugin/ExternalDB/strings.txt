@@ -1,0 +1,7 @@
+# String file for External Database Plugin
+
+PLUGIN_EXTERNALDB
+	EN	External Database Import (Example)
+
+PLUGIN_EXTERNALDB_DESC
+	EN	Example plugin demonstrating the correct way to import music metadata from an external database. This is a reference implementation showing how to avoid database corruption when integrating external data sources.
