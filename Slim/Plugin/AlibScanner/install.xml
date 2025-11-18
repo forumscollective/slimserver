@@ -2,8 +2,9 @@
 <extension>
   <name>PLUGIN_ALIBSCANNER</name>
   <creator>audiomuze</creator>
+  <category>scanning</category>
   <defaultState>enabled</defaultState>
-  <description>Causes Lyrion to build library.db from TagMinder's SQLite tags database rather than reading files from the filesystem</description>
+  <description>Causes Lyrion to build library.db from TagMinder's SQLite tags database rather than reading files from the filesystem.</description>
   <email>audiomuze@gmail.com</email>
   <id>AF52EF8A-4C76-11E5-885D-FEFF819CDC9F</id>
   <module>Slim::Plugin::AlibScanner::Plugin</module>

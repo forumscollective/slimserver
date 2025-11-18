@@ -83,18 +83,34 @@ sub startScan {
         return 0;
     }
 
-    # Signature-based short-circuit: if alib file unchanged, skip heavy ingestion
+    # Signature-based short-circuit: if alib file unchanged, normally skip ingestion.
+    # Enhancement: if any rows have sqlmodded>0 we MUST ingest even if file signature unchanged.
     my @stat = stat($alibPath);
     if (@stat) {
         my ($size, $mtime) = ($stat[7], $stat[9]);
         my $sig = "$size:$mtime";
         my $lastSig = $prefs->get('lastAlibSig');
         if (defined $lastSig && $lastSig eq $sig) {
-            $log->info("AlibScanner: alib signature unchanged ($sig) - skipping ingestion pass");
-            # Hooks not needed if we don't ingest; restore native immediately
-            _removeHooks();
-            Slim::Music::Import->endImporter($class);
-            return 0;
+            my $moddedCount = 0;
+            eval {
+                my $tmpDbh = DBI->connect(
+                    "dbi:SQLite:dbname=$alibPath", "", "",
+                    { RaiseError => 1, AutoCommit => 1, sqlite_unicode => 1 }
+                );
+                if ($tmpDbh) {
+                    ($moddedCount) = $tmpDbh->selectrow_array('SELECT COUNT(*) FROM alib WHERE sqlmodded > 0');
+                    $tmpDbh->disconnect();
+                }
+            }; $log->warn("AlibScanner: sqlmodded probe failed: $@") if $@;
+            if ($moddedCount > 0) {
+                $log->info("AlibScanner: signature unchanged ($sig) but sqlmodded row count=$moddedCount; overriding skip and ingesting");
+            }
+            else {
+                $log->info("AlibScanner: alib signature unchanged ($sig) and no sqlmodded rows; skipping ingestion pass");
+                _removeHooks();
+                Slim::Music::Import->endImporter($class);
+                return 0;
+            }
         }
         else {
             $log->info("AlibScanner: alib signature changed or first run (prev=" . (defined $lastSig ? $lastSig : 'undef') . ", new=$sig) - performing ingestion");
@@ -410,12 +426,13 @@ sub _processAllTracks {
         if ($processedNew % 500 == 0) {
             Slim::Schema->forceCommit;
             my $distinctAlbums = $debugContrib ? scalar keys %albumSeen : 0;
+            my $info = "added=$count newProgress=$processedNew/$newTotal updated=$updated" . ($debugContrib ? " albums=$distinctAlbums" : '');
             $log->error("Processed new $processedNew / $newTotal (added=$count) changed=$updated" . ($debugContrib ? " distinctAlbums=$distinctAlbums" : ''));
-            eval { $progressNew->update(undef, $processedNew) };
+            eval { $progressNew->update($info, $processedNew) };
         }
     }
     # Extra boundary update if final count divisible by 500
-    if ($processedNew % 500 == 0) { eval { $progressNew->update(undef, $processedNew) }; }
+    if ($processedNew % 500 == 0) { my $info = "added=$count finalNew=$processedNew/$newTotal"; eval { $progressNew->update($info, $processedNew) }; }
 
     # Process changed tracks
     for my $url (@changedUrls) {
@@ -428,6 +445,7 @@ sub _processAllTracks {
             });
             if ($trackObjOrId) {
                 $updated++;
+                $changes++; # count metadata updates as changes so UI "changed" operations are visible
                 $processedChanged++;
                 # Populate samplesize for changed tracks if now present
                 my $row = $alibCache->{$url};
@@ -497,15 +515,26 @@ sub _processAllTracks {
         if ($processedChanged % 500 == 0) {
             Slim::Schema->forceCommit;
             my $distinctAlbums = $debugContrib ? scalar keys %albumSeen : 0;
+            my $info = "updated=$updated changedProgress=$processedChanged/$changedTotal added=$count" . ($debugContrib ? " albums=$distinctAlbums" : '');
             $log->error("Processed changed $processedChanged / $changedTotal (added=$count updated=$updated" . ($debugContrib ? " distinctAlbums=$distinctAlbums" : '') . ")");
-            eval { $progressChanged && $progressChanged->update(undef, $processedChanged) };
+            eval { $progressChanged && $progressChanged->update($info, $processedChanged) };
         }
     }
     
     # Final commit
     Slim::Schema->forceCommit;
-    eval { $progressNew->update(undef, $processedNew); $progressNew->final($processedNew); };
-    eval { $progressChanged && $progressChanged->update(undef, $processedChanged); $progressChanged && $progressChanged->final($processedChanged); };
+    eval {
+        my $finalInfoNew = "added=$count totalNew=$processedNew/$newTotal updated=$updated";
+        $progressNew->update($finalInfoNew, $processedNew);
+        $progressNew->final($processedNew);
+    };
+    eval {
+        if ($progressChanged) {
+            my $finalInfoChanged = "updated=$updated totalChanged=$processedChanged/$changedTotal added=$count";
+            $progressChanged->update($finalInfoChanged, $processedChanged);
+            $progressChanged->final($processedChanged);
+        }
+    };
     if ($debugContrib) {
         my $finalDistinctAlbums = scalar keys %albumSeen;
         my $processedTotal = $processedNew + $processedChanged;
